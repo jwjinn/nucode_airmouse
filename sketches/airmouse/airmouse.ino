@@ -1,6 +1,6 @@
 // BLE air mouse for NUCODE NU40-DK + LSM6DS3TR-C IMU module (I2C 0x6a).
 // Wrist yaw -> cursor X, wrist pitch -> cursor Y. P0.11 = left click, P0.12 = right click,
-// P0.24 / P0.25 = sensitivity down / up (saved), P0.24 + P0.25 together = jump to screen center.
+// P0.24 / P0.25 = sensitivity down / up (saved).
 // Gyro bias is re-measured automatically whenever the module rests still for STILL_TICKS.
 // Hold both buttons for RESET_HOLD_MS to forget all hosts (clear bonds + new BLE address).
 #include <bluefruit.h>
@@ -30,13 +30,12 @@ static const char* GAIN_FILE = "/airmouse_gain";
 
 BLEDis bledis;
 // Mouse-only HID. BLEHidAdafruit also exposes a keyboard, which makes macOS open Keyboard Setup Assistant.
-// Report 1: relative mouse (motion, clicks). Report 2: absolute pointer, only used to jump to the center
-// because a relative mouse cannot know the screen size or cursor position.
+// No absolute pointer report: macOS ignores its X/Y and merges its always-zero buttons into this
+// mouse, which cancels every click.
 static uint8_t const mouseReportMap[] = {
   TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(1)),
-  TUD_HID_REPORT_DESC_ABSMOUSE(HID_REPORT_ID(2)),
 };
-BLEHidGeneric blehid(2);
+BLEHidGeneric blehid(1);
 Adafruit_LSM6DS3TRC imu;
 
 static float bias[3];
@@ -115,12 +114,6 @@ static void sendMouse(uint8_t buttons, int8_t dx, int8_t dy) {
   else blehid.inputReport(1, &r, sizeof(r));
 }
 
-static void centerCursor() {
-  hid_abs_mouse_report_t r = { 0, 0x4000, 0x4000, 0, 0 };  // absolute range is 0..0x7FFF on each axis
-  if (!blehid.isBootMode()) blehid.inputReport(2, &r, sizeof(r));  // boot protocol has no absolute report
-  accH = accV = 0;
-}
-
 static int8_t step(float rate, float& acc) {
   if (fabsf(rate) < DEADZONE) rate = 0;
   acc += rate * GAINS[gainLevel];
@@ -152,7 +145,7 @@ void setup() {
   bledis.setManufacturer("NUCODE");
   bledis.setModel("NU40DK air mouse");
   bledis.begin();
-  uint16_t inputLen[] = { sizeof(hid_mouse_report_t), sizeof(hid_abs_mouse_report_t) };
+  uint16_t inputLen[] = { sizeof(hid_mouse_report_t) };
   blehid.setReportLen(inputLen);
   blehid.enableMouse(true);
   blehid.setReportMap(mouseReportMap, sizeof(mouseReportMap));
@@ -199,30 +192,24 @@ void loop() {
   }
   uint8_t clicks = (now == BOTH) ? 0 : now;  // the reset gesture must not click
 
+  if (clicks != buttons) Serial.printf("airmouse click buttons=%d sent=%d\n", clicks, conn);
   if (conn && (dx || dy || clicks != buttons)) sendMouse(clicks, dx, dy);
   buttons = clicks;
 
-  // P0.24 / P0.25 alone step the sensitivity down / up; both together jump to the center.
-  // Acted on at release, so pressing the two buttons a little apart still counts as both.
+  // P0.24 / P0.25 step the sensitivity down / up on press.
   uint8_t side = (digitalRead(PIN_BUTTON3) == LOW ? 1 : 0) | (digitalRead(PIN_BUTTON4) == LOW ? 2 : 0);
-  static uint8_t sideHeld = 0;
+  static uint8_t sidePrev = 0;
   static uint32_t sideDone = 0;
-  if (millis() - sideDone < 50) side = 0;  // ignore contact bounce right after an action
-  if (side) {
-    sideHeld |= side;
-  } else if (sideHeld) {
-    if (sideHeld == 3) {
-      if (conn) centerCursor();
-    } else {
-      int next = gainLevel + (sideHeld == 2 ? 1 : -1);
-      if (next >= 0 && next < N_GAINS) {
-        gainLevel = next;
-        saveGain();
-      }
+  uint8_t pressed = side & ~sidePrev;
+  if ((pressed == 1 || pressed == 2) && millis() - sideDone >= 50) {  // 50 ms ignores contact bounce
+    int next = gainLevel + (pressed == 2 ? 1 : -1);
+    if (next >= 0 && next < N_GAINS) {
+      gainLevel = next;
+      saveGain();
     }
-    sideHeld = 0;
     sideDone = millis();
   }
+  sidePrev = side;
 
   static uint32_t lastLog = 0;
   if (millis() - lastLog >= 500) {
