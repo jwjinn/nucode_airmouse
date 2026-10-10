@@ -1,8 +1,14 @@
 profiles:
   nucode:
-    fqbn: adafruit:nrf52:pca10056
+    fqbn: nucode:nrf52:nu40dk
     platforms:
-      - platform: adafruit:nrf52 (1.7.0)
-        platform_index_url: https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+      # NUBoards nRF52 = Adafruit nRF52 core 1.7.0 + NU40DK board definition
+      - platform: nucode:nrf52 (1.0.2)
+        platform_index_url: https://raw.githubusercontent.com/Nucode01/Adafruit_nRF52_Arduino/refs/heads/master/package_nuduino_index.json
+    libraries:
+      # NUCODE LSM6DS3TR-C IMU module at I2C 0x6a (WHO_AM_I 0x6a)
+      - Adafruit LSM6DS (4.7.4)
+      - Adafruit BusIO (1.17.4)
+      - Adafruit Unified Sensor (1.1.15)
 
 default_profile: nucode
