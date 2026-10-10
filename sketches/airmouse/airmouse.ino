@@ -1,6 +1,6 @@
 // BLE air mouse for NUCODE NU40-DK + LSM6DS3TR-C IMU module (I2C 0x6a).
 // Wrist yaw -> cursor X, wrist pitch -> cursor Y. P0.11 = left click, P0.12 = right click,
-// P0.24 = jump to screen center.
+// P0.24 / P0.25 = sensitivity down / up (saved), P0.24 + P0.25 together = jump to screen center.
 // Gyro bias is re-measured automatically whenever the module rests still for STILL_TICKS.
 // Hold both buttons for RESET_HOLD_MS to forget all hosts (clear bonds + new BLE address).
 #include <bluefruit.h>
@@ -12,7 +12,10 @@ using namespace Adafruit_LittleFS_Namespace;
 // Watch the serial "gyro=" values while turning the module to pick axes and signs.
 const int AXIS_H = 2, AXIS_V = 1;
 const float SIGN_H = -1.0f, SIGN_V = -1.0f;
-const float GAIN = 8.0f;        // cursor counts per (rad/s) per 10 ms tick
+// Sensitivity levels in cursor counts per (rad/s) per 10 ms tick; P0.24 / P0.25 step through them.
+const float GAINS[] = { 2.5f, 3.5f, 4.5f, 6.0f, 8.0f, 11.0f, 15.0f, 20.0f, 27.0f };
+const int N_GAINS = sizeof(GAINS) / sizeof(GAINS[0]);
+static uint8_t gainLevel = 4;   // 8.0 until a saved level is loaded
 const float DEADZONE = 0.03f;   // rad/s (~1.7 dps); smaller rates are treated as hand tremor
 
 // Rest detection for auto bias: gyro and accel must stay within these bands around the
@@ -23,6 +26,7 @@ const float STILL_ACCEL = 0.15f; // m/s^2
 
 const uint32_t RESET_HOLD_MS = 3000;
 static const char* ADDR_FILE = "/airmouse_addr";
+static const char* GAIN_FILE = "/airmouse_gain";
 
 BLEDis bledis;
 // Mouse-only HID. BLEHidAdafruit also exposes a keyboard, which makes macOS open Keyboard Setup Assistant.
@@ -88,6 +92,23 @@ static void forgetHosts() {
   }
 }
 
+static void loadGain() {
+  File f(InternalFS);
+  if (!f.open(GAIN_FILE, FILE_O_READ)) return;
+  uint8_t level;
+  if (f.read(&level, 1) == 1 && level < N_GAINS) gainLevel = level;
+  f.close();
+}
+
+static void saveGain() {
+  InternalFS.remove(GAIN_FILE);  // FILE_O_WRITE appends, so start from an empty file
+  File f(InternalFS);
+  if (f.open(GAIN_FILE, FILE_O_WRITE)) {
+    f.write(&gainLevel, 1);
+    f.close();
+  }
+}
+
 static void sendMouse(uint8_t buttons, int8_t dx, int8_t dy) {
   hid_mouse_report_t r = { buttons, dx, dy, 0, 0 };
   if (blehid.isBootMode()) blehid.bootMouseReport(&r, sizeof(r));
@@ -102,7 +123,7 @@ static void centerCursor() {
 
 static int8_t step(float rate, float& acc) {
   if (fabsf(rate) < DEADZONE) rate = 0;
-  acc += rate * GAIN;
+  acc += rate * GAINS[gainLevel];
   int n = constrain((int)acc, -127, 127);
   acc -= n;
   return n;
@@ -113,6 +134,7 @@ void setup() {
   pinMode(PIN_BUTTON1, INPUT_PULLUP);
   pinMode(PIN_BUTTON2, INPUT_PULLUP);
   pinMode(PIN_BUTTON3, INPUT_PULLUP);
+  pinMode(PIN_BUTTON4, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
 
   if (!imu.begin_I2C(0x6a)) {
@@ -123,6 +145,7 @@ void setup() {
 
   Bluefruit.begin();
   loadAddr();
+  loadGain();
   Bluefruit.setName("nucode-airmouse");
   Bluefruit.Periph.setConnInterval(9, 16);  // 11.25-20 ms
   Bluefruit.setTxPower(4);
@@ -179,20 +202,38 @@ void loop() {
   if (conn && (dx || dy || clicks != buttons)) sendMouse(clicks, dx, dy);
   buttons = clicks;
 
-  bool center = digitalRead(PIN_BUTTON3) == LOW;
-  static bool centerPrev = false;
-  if (conn && center && !centerPrev) centerCursor();
-  centerPrev = center;
+  // P0.24 / P0.25 alone step the sensitivity down / up; both together jump to the center.
+  // Acted on at release, so pressing the two buttons a little apart still counts as both.
+  uint8_t side = (digitalRead(PIN_BUTTON3) == LOW ? 1 : 0) | (digitalRead(PIN_BUTTON4) == LOW ? 2 : 0);
+  static uint8_t sideHeld = 0;
+  static uint32_t sideDone = 0;
+  if (millis() - sideDone < 50) side = 0;  // ignore contact bounce right after an action
+  if (side) {
+    sideHeld |= side;
+  } else if (sideHeld) {
+    if (sideHeld == 3) {
+      if (conn) centerCursor();
+    } else {
+      int next = gainLevel + (sideHeld == 2 ? 1 : -1);
+      if (next >= 0 && next < N_GAINS) {
+        gainLevel = next;
+        saveGain();
+      }
+    }
+    sideHeld = 0;
+    sideDone = millis();
+  }
 
   static uint32_t lastLog = 0;
   if (millis() - lastLog >= 500) {
     lastLog = millis();
     uint8_t mac[6];
     Bluefruit.getAddr(mac);
-    Serial.printf("airmouse imu=1 conn=%d addr=%02X:%02X:%02X:%02X:%02X:%02X gyro=%.1f,%.1f,%.1f bias=%.1f,%.1f,%.1f dps dx=%d dy=%d buttons=%d center=%d\n",
+    Serial.printf("airmouse imu=1 conn=%d addr=%02X:%02X:%02X:%02X:%02X:%02X gyro=%.1f,%.1f,%.1f bias=%.1f,%.1f,%.1f dps dx=%d dy=%d buttons=%d side=%d gain=%.1f\n",
                   conn, mac[5], mac[4], mac[3], mac[2], mac[1], mac[0],
                   g[0] * 57.2958f, g[1] * 57.2958f, g[2] * 57.2958f,
-                  bias[0] * 57.2958f, bias[1] * 57.2958f, bias[2] * 57.2958f, dx, dy, now, center);
+                  bias[0] * 57.2958f, bias[1] * 57.2958f, bias[2] * 57.2958f, dx, dy, now, side,
+                  GAINS[gainLevel]);
   }
   delay(10);
 }
